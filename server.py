@@ -2,130 +2,125 @@ import socket
 import threading
 import time
 
-# Khởi tạo server
 HOST = '127.0.0.1'
-PORT = 55555
+PORT = 55556
 
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.bind((HOST, PORT))
-server.listen(2)  # Chỉ chấp nhận tối đa 2 kết nối
+server.listen(2)
 
-clients = []
-choices = {}
+clients = {}       # {client_socket: id}
+choices = {}       # {id: choice}
 lock = threading.Lock()
 
-# Hàm gửi tin nhắn tới tất cả client với retry
-def broadcast(message, max_retries=5):
-    with lock:
-        for i, client in enumerate(clients[:]):
-            retries = 0
-            while retries < max_retries:
-                try:
-                    client.settimeout(1.0)  # Đặt timeout để tránh treo
-                    client.send(message.encode('utf-8'))
-                    print(f"Sent to client {i}: {message} at {time.strftime('%H:%M:%S')}")
-                    break
-                except Exception as e:
-                    retries += 1
-                    print(f"Failed to send to client {i} (Attempt {retries}/{max_retries}): {e} at {time.strftime('%H:%M:%S')}")
-                    if retries == max_retries:
-                        remove_client(client)
-                    time.sleep(0.2)  # Tăng thời gian chờ giữa các lần thử
-
-# Hàm xóa client khi ngắt kết nối
 def remove_client(client):
     with lock:
         if client in clients:
-            index = clients.index(client)
-            clients.remove(client)
-            if index in choices:
-                del choices[index]
-            client.close()
-            print(f"Client {index} removed at {time.strftime('%H:%M:%S')}")
+            cid = clients[client]
+            print(f"[REMOVE] Removing client {cid}")
+            del clients[client]
+            if cid in choices:
+                del choices[cid]
+    try:
+        client.shutdown(socket.SHUT_RDWR)
+    except:
+        pass
+    client.close()
 
-# Hàm xác định người thắng
 def determine_winner():
     with lock:
-        print(f"Checking choices: {choices} at {time.strftime('%H:%M:%S')}")
+        print(f"[DEBUG] Checking choices: {choices}")
         if len(choices) != 2:
-            print(f"Error: Only {len(choices)} choices received at {time.strftime('%H:%M:%S')}")
+            print("[DEBUG] Not enough choices to determine winner.")
             return
         choice1 = choices.get(0)
         choice2 = choices.get(1)
-        
-        if not choice1 or not choice2:
-            print(f"Error: Missing choice at {time.strftime('%H:%M:%S')}")
-            return
-            
-        result = ""
-        if choice1 == choice2:
-            result = "Hòa!"
-        elif (choice1 == "keo" and choice2 == "bao") or \
-             (choice1 == "bao" and choice2 == "bua") or \
-             (choice1 == "bua" and choice2 == "keo"):
-            result = "Người chơi 1 thắng!"
-        else:
-            result = "Người chơi 2 thắng!"
-        
-        broadcast(result)
-        print(f"Winner determined: {result} at {time.strftime('%H:%M:%S')}")
-        time.sleep(0.2)  # Đợi để đảm bảo gửi xong
 
-# Hàm xử lý từng client
+    if not choice1 or not choice2:
+        print("[DEBUG] Missing choice.")
+        return
+
+    if choice1 == choice2:
+        # Hòa -> gửi cho cả 2
+        for c in clients:
+            c.send("Hòa!\n".encode('utf-8'))
+    elif (choice1 == "keo" and choice2 == "bao") or \
+         (choice1 == "bao" and choice2 == "bua") or \
+         (choice1 == "bua" and choice2 == "keo"):
+        # Client 0 thắng
+        for c, cid in clients.items():
+            if cid == 0:
+                c.send("Bạn đã thắng!\n".encode('utf-8'))
+            else:
+                c.send("Bạn đã thua!\n".encode('utf-8'))
+    else:
+        # Client 1 thắng
+        for c, cid in clients.items():
+            if cid == 1:
+                c.send("Bạn đã thắng!\n".encode('utf-8'))
+            else:
+                c.send("Bạn đã thua!\n".encode('utf-8'))
+
+    time.sleep(2)
+    for c in clients:
+        c.send("NEW_GAME\n".encode('utf-8'))
+
+    with lock:
+        choices.clear()
+    print("[DEBUG] Game reset.")
+
 def handle_client(client):
+    buffer = ""
+    cid = clients[client]
     while True:
         try:
-            client.settimeout(10.0)  # Đặt timeout cho recv
-            choice = client.recv(1024).decode('utf-8')
-            if not choice:
+            data = client.recv(1024).decode('utf-8')
+            if not data:
+                print(f"[DISCONNECT] Client {cid} disconnected.")
+                remove_client(client)
                 break
-                
-            with lock:
-                client_id = clients.index(client)
-                choices[client_id] = choice
-                print(f"Client {client_id} chose: {choice} at {time.strftime('%H:%M:%S')}")
-            
-            with lock:
-                if len(choices) == 2:
-                    print(f"Two choices received: {choices} at {time.strftime('%H:%M:%S')}")
+
+            buffer += data
+            while '\n' in buffer:
+                message, buffer = buffer.split('\n', 1)
+                message = message.strip()
+                if not message:
+                    continue
+                with lock:
+                    choices[cid] = message
+                print(f"[CHOICE] Client {cid} chose: {message}")
+
+                trigger = False
+                with lock:
+                    if len(choices) == 2:
+                        trigger = True
+                if trigger:
                     determine_winner()
-                    broadcast("NEW_GAME")
-                    choices.clear()
-                    print(f"Game reset at {time.strftime('%H:%M:%S')}")
-                    
-        except socket.timeout:
-            print(f"Timeout for client {clients.index(client)} at {time.strftime('%H:%M:%S')}")
-            remove_client(client)
-            break
+
         except Exception as e:
-            print(f"Error in handle_client: {e} at {time.strftime('%H:%M:%S')}")
+            print(f"[ERROR] Client {cid}: {e}")
             remove_client(client)
             break
 
-# Hàm chính của server
 def main():
-    print(f"Server đang chạy trên {HOST}:{PORT} at {time.strftime('%H:%M:%S')}")
-    
+    print(f"[SERVER] Running on {HOST}:{PORT}")
+    next_id = 0
     while True:
-        try:
-            client, address = server.accept()
-            print(f"Kết nối mới từ {address} at {time.strftime('%H:%M:%S')}")
-            
-            with lock:
-                if len(clients) < 2:
-                    clients.append(client)
-                    client.send("CONNECTED".encode('utf-8'))
-                    
-                    if len(clients) == 2:
-                        for i, c in enumerate(clients):
-                            c.send("START".encode('utf-8'))
-                            print(f"Sent START to client {i} at {time.strftime('%H:%M:%S')}")
-                else:
-                    client.send("FULL".encode('utf-8'))
-                    client.close()
-        except Exception as e:
-            print(f"Lỗi khi chấp nhận kết nối: {e} at {time.strftime('%H:%M:%S')}")
-            break
+        client, addr = server.accept()
+        print(f"[CONNECT] New connection from {addr}")
+        with lock:
+            if len(clients) < 2:
+                clients[client] = next_id
+                client.send("CONNECTED\n".encode('utf-8'))
+                next_id += 1
+                if len(clients) == 2:
+                    for c in clients:
+                        c.send("START\n".encode('utf-8'))
+                    for c in clients:
+                        threading.Thread(target=handle_client, args=(c,), daemon=True).start()
+            else:
+                client.send("FULL\n".encode('utf-8'))
+                client.close()
 
 if __name__ == "__main__":
     main()
